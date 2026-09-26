@@ -472,6 +472,69 @@ class StartupOrderResponse(BaseModel):
     )
 
 
+class VoltageMeasurementInput(BaseModel):
+    """一个非 source 节点的实测电压。"""
+
+    node: str = Field(min_length=1, description="测点节点名称（须为已有的非 source 节点，工况内唯一）")
+    voltage: float = Field(allow_inf_nan=False, description="实测电压 (V)，须为有限数")
+
+
+class CalibrationScenarioInput(BaseModel):
+    """一个辨识工况：已知负载与若干非 source 节点的实测电压。"""
+
+    source_voltage: float = Field(
+        gt=0, allow_inf_nan=False, description="电源电压 (V)，必须为正且为有限数"
+    )
+    loads: list[LoadInput] = Field(default_factory=list, description="该工况下各节点恒定负载电流")
+    measurements: list[VoltageMeasurementInput] = Field(
+        default_factory=list, description="非 source 节点的实测电压列表（工况内节点唯一）"
+    )
+
+
+class ResistanceCalibrationRequest(BaseModel):
+    """电阻辨识请求：复用 segments（其电阻不参与拟合），另给多工况与非负残差容限。"""
+
+    segments: list[SegmentInput] = Field(
+        min_length=1,
+        description="线段列表，须构成以 source 为根的连通树；输入电阻不参与拟合",
+    )
+    scenarios: list[CalibrationScenarioInput] = Field(
+        min_length=1, description="辨识工况列表（至少 1 个），逐工况累计未舍入电流"
+    )
+    tolerance: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="非负残差容限 (V)：满秩时最大测点电压残差超过它判 inconsistent",
+    )
+
+
+class CalibratedSegmentResult(BaseModel):
+    segment_id: str
+    parent: str
+    child: str
+    resistance: float = Field(description="辨识得到的线段电阻估计值 (Ω)，展示值按 6 位小数舍入")
+
+
+class ResistanceCalibrationResponse(BaseModel):
+    status: str = Field(
+        description="辨识结果：calibrated=满秩且最大残差不超过容限，"
+        "undetermined=系数矩阵列秩不足，inconsistent=满秩但最大残差超过容限"
+    )
+    segments: Optional[list[CalibratedSegmentResult]] = Field(
+        default=None,
+        description="各段估计电阻（按线段输入顺序）；仅 status=calibrated 时给出，其余为 null",
+    )
+    max_residual: Optional[float] = Field(
+        default=None,
+        description="最大测点电压残差 (V)，展示值按 6 位小数舍入；"
+        "calibrated / inconsistent 时给出，undetermined 为 null",
+    )
+    matrix_rank: Optional[int] = Field(
+        default=None,
+        description="压降方程系数矩阵的列秩；仅 status=undetermined 时给出，其余为 null",
+    )
+
+
 class LossAllocationRequest(EvaluateRequest):
     """线损归属评估请求：与 /evaluate 参数完全相同（min_voltage 参与校验但不影响线损计算）。"""
 

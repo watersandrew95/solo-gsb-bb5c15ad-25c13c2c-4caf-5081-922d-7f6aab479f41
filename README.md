@@ -1,6 +1,6 @@
 # 直流配电树压降校核 API
 
-基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`），按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险（`/protection-selectivity`），为 1～10 条待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序（`/startup-order`），或按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属（`/loss-allocation`）。
+基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`），按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险（`/protection-selectivity`），为 1～10 条待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序（`/startup-order`），按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属（`/loss-allocation`），或从多组已知负载工况与节点实测电压辨识配电树各段电阻（`/resistance-calibration`）。
 
 ## 快速启动（单条命令）
 
@@ -30,6 +30,7 @@ docker compose up --build
 - 保护选择性校核接口：`POST http://localhost:8000/protection-selectivity`
 - 投运顺序评估接口：`POST http://localhost:8000/startup-order`
 - 线损归属评估接口：`POST http://localhost:8000/loss-allocation`
+- 电阻辨识接口：`POST http://localhost:8000/resistance-calibration`
 
 ## 请求格式
 
@@ -741,6 +742,89 @@ curl -X POST http://localhost:8000/loss-allocation \
 - `loads[].loss`：该负载承担的线损总和 (W)；`loads[].segments` 为其到 `source` 路径各段上的归属明细（自负载节点向 `source` 排序，`source` 节点负载为空列表）。上例负载 1（b 点 5A）在 s2 上承担 5 × 5 × 0.2 = 5.0W、在 s1 上承担 5 × 15 × 0.1 = 7.5W，合计 12.5W。
 - 逐负载归属之和 = 3.0 + 12.5 + 15.2 = 30.7W，与总线损一致。
 
+## 电阻辨识：POST /resistance-calibration
+
+`POST /resistance-calibration`，Content-Type: `application/json`。从多组已知负载工况及非 `source` 节点的实测电压辨识配电树各段电阻。请求复用 `/evaluate` 的 `segments`（**输入线段电阻不参与拟合**，仅使用树结构；`rated_current` 仍需按原约束给出），另给 `scenarios` 与非负残差容限 `tolerance`：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `segments` | array | 至少 1 条 | 线段列表，须构成以 `source` 为根的连通树（结构同 `/evaluate`） |
+| `scenarios` | array | 至少 1 个 | 辨识工况列表，逐工况累计未舍入电流 |
+| `scenarios[].source_voltage` | number | > 0 且为有限数 | 该工况电源电压 (V) |
+| `scenarios[].loads` | array | 可空 | 该工况各节点恒定负载（结构同 `/evaluate` 的 `loads`） |
+| `scenarios[].measurements` | array | 可空 | 该工况非 `source` 节点的实测电压列表 |
+| `scenarios[].measurements[].node` | string | 必填，工况内唯一 | 测点节点（重复、不存在或为 `source` 返回 `400 invalid_input`） |
+| `scenarios[].measurements[].voltage` | number | 须为有限数 | 实测电压 (V)（NaN/Infinity 返回 `422`） |
+| `tolerance` | number | ≥ 0 且为有限数 | 残差容限 (V)：满秩时最大测点电压残差超过它判 `inconsistent` |
+
+辨识规则：
+
+- 逐工况按与 `/evaluate` 相同的规则自叶向根累计**未舍入**线段电流；
+- 每个测点对应一条压降方程：**测点根路径各段电流 × 待求电阻之和 = 工况电源电压 − 测点实测电压**；
+- 全部工况的方程联立为 `Ax = b`（A 的列 = 线段，按输入顺序），求**非负最小二乘解**（x ≥ 0）；
+- A 列秩 < 线段数 → `undetermined`（电流恒为零的线段对应全零列，无法辨识）；
+- 满秩但最大测点电压残差（未舍入值）超过 `tolerance` → `inconsistent`（恰好等于容限不算超过）；
+- 否则 → `calibrated`，返回输入顺序的各段估计电阻与最大残差；输出数值保留六位小数。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/resistance-calibration \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"id": "s1", "parent": "source", "child": "a", "resistance": 0.0, "rated_current": 20.0},
+      {"id": "s2", "parent": "a",      "child": "b", "resistance": 0.0, "rated_current": 10.0},
+      {"id": "s3", "parent": "a",      "child": "c", "resistance": 0.0, "rated_current": 15.0}
+    ],
+    "scenarios": [
+      {
+        "source_voltage": 48.0,
+        "loads": [
+          {"node": "a", "current": 2.0},
+          {"node": "b", "current": 5.0},
+          {"node": "c", "current": 8.0}
+        ],
+        "measurements": [
+          {"node": "a", "voltage": 46.5},
+          {"node": "b", "voltage": 45.5},
+          {"node": "c", "voltage": 46.1}
+        ]
+      },
+      {
+        "source_voltage": 48.0,
+        "loads": [{"node": "b", "current": 10.0}],
+        "measurements": [
+          {"node": "a", "voltage": 47.0},
+          {"node": "b", "voltage": 45.0},
+          {"node": "c", "voltage": 47.0}
+        ]
+      }
+    ],
+    "tolerance": 0.001
+  }'
+```
+
+### 响应示例（200，calibrated）
+
+```json
+{
+  "status": "calibrated",
+  "segments": [
+    {"segment_id": "s1", "parent": "source", "child": "a", "resistance": 0.1},
+    {"segment_id": "s2", "parent": "a", "child": "b", "resistance": 0.2},
+    {"segment_id": "s3", "parent": "a", "child": "c", "resistance": 0.05}
+  ],
+  "max_residual": 0.0,
+  "matrix_rank": null
+}
+```
+
+- `status`：`calibrated`（满秩且最大残差不超过容限）、`undetermined`（系数矩阵列秩不足）、`inconsistent`（满秩但最大残差超过容限）。
+- `segments`：各段估计电阻 (Ω)，按线段输入顺序，六位小数；仅 `calibrated` 时给出，其余为 `null`。上例工况一段电流为 (15, 5, 8)，测点方程如 `15·R1 = 48 − 46.5`，两工况联立即辨识出真实电阻。
+- `max_residual`：最大测点电压残差 (V)，六位小数；`calibrated` / `inconsistent` 时给出，`undetermined` 为 `null`。
+- `matrix_rank`：系数矩阵列秩；仅 `undetermined` 时给出（如上例只测节点 `a` 时列秩为 1），其余为 `null`。
+
 ## 错误说明
 
 所有错误均返回统一结构：
@@ -757,11 +841,11 @@ curl -X POST http://localhost:8000/loss-allocation \
 
 | 状态码 | code | 触发场景 |
 | --- | --- | --- |
-| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、保护曲线点电流非严格递增 / 曲线电流或动作时间为负或非有限数 / 曲线点为空 / 曲线或故障列表为空、故障电流非正或非有限数、最小级差为负或非有限数、`startup_loads` 不在 1～10 条范围内 / 待投运负载的稳态电流或启动电流为负或非有限数 / 启动电流小于稳态电流、字段缺失或类型错误等 |
-| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复、保护曲线未覆盖全部线段 / 线段 id 重复 / 曲线线段不存在于树中、故障节点不存在或为 `source`、待投运负载节点不存在于树中 |
+| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、保护曲线点电流非严格递增 / 曲线电流或动作时间为负或非有限数 / 曲线点为空 / 曲线或故障列表为空、故障电流非正或非有限数、最小级差为负或非有限数、`startup_loads` 不在 1～10 条范围内 / 待投运负载的稳态电流或启动电流为负或非有限数 / 启动电流小于稳态电流、`scenarios` 为空 / 工况电源电压非正或非有限数 / 测点电压非有限数、`tolerance` 为负或非有限数、字段缺失或类型错误等 |
+| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复、保护曲线未覆盖全部线段 / 线段 id 重复 / 曲线线段不存在于树中、故障节点不存在或为 `source`、待投运负载节点不存在于树中、电压测点节点工况内重复 / 不存在于树中 / 为 `source` |
 | `400` | `baseline_violation` | `/capacity` 与 `/startup-order` 基线校核（仅既有负载）已存在超额定电流或欠压，`details` 列出越限线段与节点 |
 
-注意：`/unregistered-load` 的 `inconsistent` / `undetermined` 是正常分析结论，以 `200` 返回并体现在响应体的 `status` 字段中，不属于上表错误。
+注意：`/unregistered-load` 的 `inconsistent` / `undetermined` 与 `/resistance-calibration` 的 `undetermined` / `inconsistent` 是正常分析结论，以 `200` 返回并体现在响应体的 `status` 字段中，不属于上表错误。
 
 ## 本地开发与测试
 
@@ -776,7 +860,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py    # FastAPI 应用与错误处理
-  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案 + 保护选择性校核 + 投运顺序搜索 + 线损归属
+  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案 + 保护选择性校核 + 投运顺序搜索 + 线损归属 + 电阻辨识
   models.py  # 请求 / 响应模型
 tests/
   test_evaluate.py
@@ -788,6 +872,7 @@ tests/
   test_protection_selectivity.py
   test_startup_order.py
   test_loss_allocation.py
+  test_resistance_calibration.py
 Dockerfile
 docker-compose.yml
 requirements.txt

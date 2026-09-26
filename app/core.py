@@ -49,6 +49,14 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 承担 负载电流 × 该段总电流 × 该段电阻——同一段上全部下游负载的归属之和恰等于该段
 线损，故逐负载归属之和与总线损一致（展示舍入差除外）。source 节点负载路径为空、
 归属为零；同节点多条负载分别列出。计算与汇总使用未舍入值，展示值按 6 位小数舍入。
+
+``resistance_calibration`` 从多组工况（各含电源电压、已知负载与若干非 source 节点的
+实测电压）辨识各段电阻，输入线段电阻不参与拟合。逐工况按与 ``evaluate`` 相同的规则
+自叶向根累计未舍入线段电流，每个测点对应一条压降方程（测点根路径各段电流 × 待求
+电阻之和 = 电源电压 − 实测电压），全部工况联立后对系数矩阵求非负最小二乘解
+（Lawson–Hanson 活动集法）。系数矩阵列秩不足返回 ``undetermined`` 与矩阵秩；满秩但
+最大测点电压残差超过容限返回 ``inconsistent`` 与最大残差；否则返回 ``calibrated``、
+输入顺序的各段估计电阻与最大残差（展示值按 6 位小数舍入，判定使用未舍入值）。
 """
 
 from __future__ import annotations
@@ -1469,4 +1477,211 @@ def loss_allocation(
         "total_loss": _round(total_loss),
         "segments": segment_results,
         "loads": load_results,
+    }
+
+
+def _matrix_rank(matrix: Sequence[Sequence[float]]) -> int:
+    """高斯消元（部分主元）估计矩阵列秩。"""
+    a = [list(row) for row in matrix]
+    if not a:
+        return 0
+    m, n = len(a), len(a[0])
+    max_abs = max(abs(v) for row in a for v in row)
+    if max_abs == 0.0:
+        return 0
+    tol = max_abs * max(m, n) * 1e-12
+    rank = 0
+    for col in range(n):
+        if rank >= m:
+            break
+        pivot = max(range(rank, m), key=lambda r: abs(a[r][col]))
+        if abs(a[pivot][col]) <= tol:
+            continue
+        a[rank], a[pivot] = a[pivot], a[rank]
+        for r in range(rank + 1, m):
+            factor = a[r][col] / a[rank][col]
+            if factor == 0.0:
+                continue
+            for c in range(col, n):
+                a[r][c] -= factor * a[rank][c]
+        rank += 1
+    return rank
+
+
+def _solve_linear(matrix: list[list[float]], rhs: list[float]) -> list[float]:
+    """高斯消元（部分主元）求解非奇异方阵线性方程组。"""
+    n = len(matrix)
+    a = [row[:] + [rhs[i]] for i, row in enumerate(matrix)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(a[r][col]))
+        a[col], a[pivot] = a[pivot], a[col]
+        for r in range(col + 1, n):
+            factor = a[r][col] / a[col][col]
+            if factor == 0.0:
+                continue
+            for c in range(col, n + 1):
+                a[r][c] -= factor * a[col][c]
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        residual = a[i][n] - sum(a[i][j] * x[j] for j in range(i + 1, n))
+        x[i] = residual / a[i][i]
+    return x
+
+
+def _nnls(a_matrix: list[list[float]], b: list[float]) -> list[float]:
+    """Lawson–Hanson 活动集法求 min ||Ax − b||₂ 的非负最小二乘解（x ≥ 0）。
+
+    内层最小二乘用正规方程求解；调用前须保证 A 列满秩（其列子集亦列满秩，
+    正规方程系数矩阵对称正定，可解）。
+    """
+    m = len(a_matrix)
+    n = len(a_matrix[0])
+
+    # 预计算 AᵀA 与 Aᵀb
+    ata = [[0.0] * n for _ in range(n)]
+    atb = [0.0] * n
+    for k in range(m):
+        row = a_matrix[k]
+        bk = b[k]
+        for i in range(n):
+            ai = row[i]
+            if ai == 0.0:
+                continue
+            atb[i] += ai * bk
+            for j in range(i, n):
+                ata[i][j] += ai * row[j]
+    for i in range(n):
+        for j in range(i):
+            ata[i][j] = ata[j][i]
+
+    x = [0.0] * n
+    passive: list[int] = []  # 允许取正值的列（保持加入顺序）
+    active = set(range(n))  # 固定在 0 的列
+    grad = atb[:]  # 梯度 Aᵀ(b − Ax)，x = 0 时即 Aᵀb
+    grad_tol = 1e-12 * max(1.0, max(abs(v) for v in atb))
+
+    while active:
+        best = max(active, key=lambda j: grad[j])
+        if grad[best] <= grad_tol:
+            break
+        passive.append(best)
+        active.discard(best)
+        while True:
+            # 在 passive 列子集上解无约束最小二乘（正规方程）
+            sub = [[ata[i][j] for j in passive] for i in passive]
+            s = _solve_linear(sub, [atb[i] for i in passive])
+            if all(v > 0.0 for v in s):
+                break
+            # 沿 (x → s) 方向回退到首个触零分量，将其移回 active
+            alpha = 1.0
+            for idx, i in enumerate(passive):
+                if s[idx] <= 0.0 and x[i] > 0.0:
+                    alpha = min(alpha, x[i] / (x[i] - s[idx]))
+            for idx, i in enumerate(passive):
+                x[i] += alpha * (s[idx] - x[i])
+            zero_eps = 1e-12 * max(1.0, max(abs(v) for v in x))
+            for i in list(passive):
+                if x[i] <= zero_eps:
+                    x[i] = 0.0
+                    passive.remove(i)
+                    active.add(i)
+        for idx, i in enumerate(passive):
+            x[i] = s[idx]
+        grad = [atb[i] - sum(ata[i][j] * x[j] for j in range(n)) for i in range(n)]
+
+    return x
+
+
+def resistance_calibration(segments_in: Sequence, scenarios_in: Sequence, tolerance: float) -> dict:
+    """从多工况已知负载与节点实测电压辨识各段电阻，返回可 JSON 序列化的结果字典。
+
+    输入线段电阻不参与拟合（仅使用树结构）。逐工况按与 ``evaluate`` 相同的规则
+    自叶向根累计未舍入线段电流；每个测点（非 source 节点的实测电压）对应一条
+    压降方程：
+
+        Σ（测点根路径各段电流 × 待求电阻）= 工况电源电压 − 测点实测电压
+
+    全部工况的方程联立为 Ax = b（A 的列 = 线段，按输入顺序），求非负最小二乘解：
+
+    - A 列秩 < 线段数 → ``undetermined``，返回矩阵列秩；
+    - 满秩但最大测点电压残差（未舍入值）超过 tolerance + EPS → ``inconsistent``，
+      返回最大残差；
+    - 否则 → ``calibrated``，返回输入顺序的各段估计电阻与最大残差（六位小数）。
+    """
+    # 逐工况校验树与负载，并累计未舍入线段电流
+    trees = [
+        _prepare_tree(scenario.source_voltage, segments_in, scenario.loads)
+        for scenario in scenarios_in
+    ]
+
+    # 测点校验：工况内不重复、须为已有的非 source 节点
+    known_nodes = set(trees[0].parent_of) | {ROOT_NODE}
+    errors: list[str] = []
+    for s_index, scenario in enumerate(scenarios_in):
+        seen_nodes: set[str] = set()
+        for m in scenario.measurements:
+            if m.node in seen_nodes:
+                errors.append(f"第 {s_index + 1} 个工况的测点节点重复: '{m.node}'")
+            seen_nodes.add(m.node)
+            if m.node == ROOT_NODE:
+                errors.append(f"第 {s_index + 1} 个工况的测点节点不能为根节点 '{ROOT_NODE}'")
+            elif m.node not in known_nodes:
+                errors.append(f"第 {s_index + 1} 个工况的测点节点 '{m.node}' 不存在于树中")
+    if errors:
+        raise InputValidationError("电压测点定义无效", errors)
+
+    segments = trees[0].segments
+    n = len(segments)
+    seg_index = {seg.id: k for k, seg in enumerate(segments)}
+    seg_by_child = {seg.child: seg for seg in segments}
+
+    # 组装压降方程：每行 = 一个测点，每列 = 一条线段（输入顺序）
+    a_matrix: list[list[float]] = []
+    b_vector: list[float] = []
+    for tree, scenario in zip(trees, scenarios_in):
+        for m in scenario.measurements:
+            row = [0.0] * n
+            node = m.node
+            while node != ROOT_NODE:
+                seg = seg_by_child[node]
+                row[seg_index[seg.id]] = tree.seg_current[seg.id]
+                node = seg.parent
+            a_matrix.append(row)
+            b_vector.append(scenario.source_voltage - m.voltage)
+
+    rank = _matrix_rank(a_matrix)
+    if rank < n:
+        return {
+            "status": "undetermined",
+            "segments": None,
+            "max_residual": None,
+            "matrix_rank": rank,
+        }
+
+    solution = _nnls(a_matrix, b_vector)
+    max_residual = max(
+        abs(rhs - sum(coef * value for coef, value in zip(row, solution)))
+        for row, rhs in zip(a_matrix, b_vector)
+    )
+    if max_residual > tolerance + EPS:
+        return {
+            "status": "inconsistent",
+            "segments": None,
+            "max_residual": _round(max_residual),
+            "matrix_rank": None,
+        }
+
+    return {
+        "status": "calibrated",
+        "segments": [
+            {
+                "segment_id": seg.id,
+                "parent": seg.parent,
+                "child": seg.child,
+                "resistance": _round(solution[k]),
+            }
+            for k, seg in enumerate(segments)
+        ],
+        "max_residual": _round(max_residual),
+        "matrix_rank": None,
     }
