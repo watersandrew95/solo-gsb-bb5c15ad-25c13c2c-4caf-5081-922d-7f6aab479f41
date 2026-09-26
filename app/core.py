@@ -49,6 +49,14 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 承担 负载电流 × 该段总电流 × 该段电阻——同一段上全部下游负载的归属之和恰等于该段
 线损，故逐负载归属之和与总线损一致（展示舍入差除外）。source 节点负载路径为空、
 归属为零；同节点多条负载分别列出。计算与汇总使用未舍入值，展示值按 6 位小数舍入。
+
+``resistance_calibration`` 从多组工况（各含电源电压、恒定负载与非 source 节点的
+实测电压）辨识各段电阻：输入线段电阻不参与拟合，逐工况按现有树规则累计未舍入线段
+电流，每个测点以其根路径各段电流为系数组成压降方程（各段电流 × 电阻之和 =
+电源电压 − 实测电压），全部测点方程联立求非负最小二乘解（Lawson-Hanson NNLS）。
+系数矩阵列秩不足时返回 ``undetermined`` 与矩阵秩；满秩但最大测点电压残差超过容限
+时返回 ``inconsistent`` 与最大残差；否则返回 ``calibrated``、按输入顺序的各段估计
+电阻与最大残差（展示值按 6 位小数舍入，判定使用未舍入值）。
 """
 
 from __future__ import annotations
@@ -1469,4 +1477,213 @@ def loss_allocation(
         "total_loss": _round(total_loss),
         "segments": segment_results,
         "loads": load_results,
+    }
+
+
+def _matrix_rank(matrix: list[list[float]]) -> int:
+    """系数矩阵的数值列秩（部分主元高斯消元，主元容差按矩阵规模缩放）。"""
+    if not matrix:
+        return 0
+    n_rows, n_cols = len(matrix), len(matrix[0])
+    a = [row[:] for row in matrix]
+    max_abs = max(abs(value) for row in a for value in row)
+    if max_abs == 0.0:
+        return 0
+    tol = max_abs * max(n_rows, n_cols) * 2.220446049250313e-16
+    rank = 0
+    for col in range(n_cols):
+        if rank >= n_rows:
+            break
+        pivot = max(range(rank, n_rows), key=lambda r: abs(a[r][col]))
+        if abs(a[pivot][col]) <= tol:
+            continue
+        a[rank], a[pivot] = a[pivot], a[rank]
+        pivot_value = a[rank][col]
+        for r in range(rank + 1, n_rows):
+            factor = a[r][col] / pivot_value
+            if factor != 0.0:
+                for c in range(col, n_cols):
+                    a[r][c] -= factor * a[rank][c]
+        rank += 1
+    return rank
+
+
+def _solve_linear_system(matrix: list[list[float]], rhs: list[float]) -> list[float]:
+    """部分主元高斯消元解方阵线性方程组（调用方保证系数矩阵非奇异）。"""
+    size = len(rhs)
+    a = [row[:] + [rhs[i]] for i, row in enumerate(matrix)]
+    for col in range(size):
+        pivot = max(range(col, size), key=lambda r: abs(a[r][col]))
+        a[col], a[pivot] = a[pivot], a[col]
+        pivot_value = a[col][col]
+        for r in range(col + 1, size):
+            factor = a[r][col] / pivot_value
+            if factor != 0.0:
+                for c in range(col, size + 1):
+                    a[r][c] -= factor * a[col][c]
+    solution = [0.0] * size
+    for i in range(size - 1, -1, -1):
+        residual = a[i][size] - sum(a[i][j] * solution[j] for j in range(i + 1, size))
+        solution[i] = residual / a[i][i]
+    return solution
+
+
+def _nnls(matrix: list[list[float]], rhs: list[float], n_cols: int) -> list[float]:
+    """Lawson-Hanson 非负最小二乘：min ‖A·x − rhs‖₂ 且 x ≥ 0。
+
+    调用方保证 A 满列秩，被动集列的正规方程始终非奇异；迭代上限仅为数值兜底，
+    正常输入远在上限内收敛。
+    """
+    x = [0.0] * n_cols
+    passive = [False] * n_cols
+
+    def _gradient() -> list[float]:
+        # w = Aᵀ·(rhs − A·x)
+        residual = [
+            bi - sum(row[j] * x[j] for j in range(n_cols))
+            for row, bi in zip(matrix, rhs)
+        ]
+        return [sum(row[j] * ri for row, ri in zip(matrix, residual)) for j in range(n_cols)]
+
+    grad_scale = max(1.0, max(abs(w) for w in _gradient()))
+    grad_tol = 1e-10 * grad_scale
+
+    max_iter = 100 * (n_cols + 1)
+    for _ in range(max_iter):
+        gradient = _gradient()
+        # KKT 收敛条件：主动集（x=0）各分量梯度均不超过容差
+        best_j = -1
+        best_w = grad_tol
+        for j in range(n_cols):
+            if not passive[j] and gradient[j] > best_w:
+                best_j, best_w = j, gradient[j]
+        if best_j < 0:
+            break
+        passive[best_j] = True
+
+        # 内层循环：在被动集上解最小二乘，把非正分量逐步移回主动集
+        for _ in range(max_iter):
+            cols = [j for j in range(n_cols) if passive[j]]
+            normal = [
+                [sum(row[p] * row[q] for row in matrix) for q in cols]
+                for p in cols
+            ]
+            projected = [sum(row[p] * bi for row, bi in zip(matrix, rhs)) for p in cols]
+            z = _solve_linear_system(normal, projected)
+            if all(value > 0.0 for value in z):
+                for t, j in enumerate(cols):
+                    x[j] = z[t]
+                break
+            # 沿 x → z 方向移动至首个触零分量（步长 α ∈ [0, 1]）
+            alpha = 1.0
+            for t, j in enumerate(cols):
+                if z[t] <= 0.0 and x[j] - z[t] > 0.0:
+                    alpha = min(alpha, x[j] / (x[j] - z[t]))
+            for t, j in enumerate(cols):
+                x[j] += alpha * (z[t] - x[j])
+            for j in cols:
+                if x[j] <= 0.0:
+                    x[j] = 0.0
+                    passive[j] = False
+        else:
+            break  # 内层未收敛（数值兜底），按当前解返回
+    return x
+
+
+def resistance_calibration(
+    segments_in: Sequence,
+    scenarios_in: Sequence,
+    tolerance: float,
+) -> dict:
+    """从多组工况的节点实测电压辨识各段电阻，返回可 JSON 序列化的结果字典。
+
+    输入线段电阻不参与拟合（仅定义树结构）。逐工况按现有树规则累计未舍入线段
+    电流；每个测点（非 source 节点）组成一条压降方程：测点根路径各段
+    电流 × 电阻之和 = 该工况电源电压 − 实测电压（路径外线段系数为 0）。全部
+    测点方程联立为系数矩阵（行 = 测点，列 = 线段，按线段输入顺序），求非负
+    最小二乘解（R ≥ 0）：
+
+    - 系数矩阵列秩不足 → ``undetermined``，返回矩阵秩 ``rank``；
+    - 满秩但最大测点电压残差（拟合压降与实测压降之差的最大绝对值）超过
+      ``tolerance``（EPS 容差内视为恰好触限）→ ``inconsistent``，返回最大残差；
+    - 否则 → ``calibrated``，返回按输入顺序的各段估计电阻与最大残差。
+
+    估计电阻与最大残差按 6 位小数返回，判定使用未舍入值。
+    """
+    # 树结构校验（不连通、环路等错误与工况无关，不带工况前缀）
+    _validate_and_build_tree(segments_in)
+
+    # 逐工况累计未舍入线段电流（负载校验错误带工况序号以便定位）
+    scenario_trees: list[_Tree] = []
+    for index, scenario in enumerate(scenarios_in):
+        try:
+            scenario_trees.append(
+                _prepare_tree(scenario.source_voltage, segments_in, scenario.loads)
+            )
+        except InputValidationError as exc:
+            details = [f"工况 {index + 1}: {item}" for item in exc.details]
+            raise InputValidationError(exc.message, details) from exc
+
+    segments = scenario_trees[0].segments
+    known_nodes = set(scenario_trees[0].parent_of) | {ROOT_NODE}
+
+    # 测点校验：同一工况内节点不得重复，须为已有的非 source 节点
+    errors: list[str] = []
+    for index, scenario in enumerate(scenarios_in):
+        seen_nodes: set[str] = set()
+        for measurement in scenario.measurements:
+            node = measurement.node
+            if node in seen_nodes:
+                errors.append(f"工况 {index + 1} 的测点节点重复: '{node}'")
+            seen_nodes.add(node)
+            if node == ROOT_NODE:
+                errors.append(f"工况 {index + 1} 的测点节点不能为根节点 '{ROOT_NODE}'")
+            elif node not in known_nodes:
+                errors.append(f"工况 {index + 1} 的测点节点 '{node}' 不存在于树中")
+    if errors:
+        raise InputValidationError("实测电压定义无效", errors)
+
+    # 压降方程：每测点一行，根路径各段未舍入电流为系数，电源电压 − 实测电压为右端
+    seg_by_child = {seg.child: seg for seg in segments}
+    matrix: list[list[float]] = []
+    rhs: list[float] = []
+    for scenario, tree in zip(scenarios_in, scenario_trees):
+        for measurement in scenario.measurements:
+            path_ids: set[str] = set()
+            node = measurement.node
+            while node != ROOT_NODE:
+                seg = seg_by_child[node]
+                path_ids.add(seg.id)
+                node = seg.parent
+            matrix.append(
+                [tree.seg_current[seg.id] if seg.id in path_ids else 0.0 for seg in segments]
+            )
+            rhs.append(scenario.source_voltage - measurement.voltage)
+
+    n_cols = len(segments)
+    rank = _matrix_rank(matrix)
+    if rank < n_cols:
+        return {"status": "undetermined", "segments": None, "max_residual": None, "rank": rank}
+
+    solution = _nnls(matrix, rhs, n_cols)
+    max_residual = max(
+        abs(sum(row[j] * solution[j] for j in range(n_cols)) - bi)
+        for row, bi in zip(matrix, rhs)
+    )
+    if max_residual > tolerance + EPS:
+        return {
+            "status": "inconsistent",
+            "segments": None,
+            "max_residual": _round(max_residual),
+            "rank": None,
+        }
+
+    return {
+        "status": "calibrated",
+        "segments": [
+            {"segment_id": seg.id, "resistance": _round(solution[j])}
+            for j, seg in enumerate(segments)
+        ],
+        "max_residual": _round(max_residual),
+        "rank": None,
     }

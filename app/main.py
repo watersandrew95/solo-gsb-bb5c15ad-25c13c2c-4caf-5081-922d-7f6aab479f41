@@ -16,6 +16,7 @@ from .core import (
     outage_restoration,
     peak_risk,
     protection_selectivity,
+    resistance_calibration,
     startup_order,
     unregistered_load,
 )
@@ -34,6 +35,8 @@ from .models import (
     PeakRiskResponse,
     ProtectionSelectivityRequest,
     ProtectionSelectivityResponse,
+    ResistanceCalibrationRequest,
+    ResistanceCalibrationResponse,
     StartupOrderRequest,
     StartupOrderResponse,
     UnregisteredLoadRequest,
@@ -52,9 +55,10 @@ app = FastAPI(
         "枚举可切除负载组合，选出以最小切除电流消除全部越限的切负荷方案，"
         "按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险，"
         "为待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序，"
-        "或按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属。"
+        "或按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属，"
+        "或从多组已知负载工况与非 source 节点实测电压辨识各段电阻（非负最小二乘）。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -93,12 +97,17 @@ _FIELD_LABELS = {
     "startup_loads": "待投运负载列表",
     "steady_current": "稳态电流",
     "startup_current": "启动电流",
+    "scenarios": "工况列表",
+    "tolerance": "残差容限",
+    "voltage": "实测电压",
 }
 
 # measurements 内字段的中文标签（与负载字段同名时区分为“实测”）
 _MEASUREMENT_FIELD_LABELS = {
     "current": "实测电流",
     "segment_id": "测点线段标识",
+    "node": "测点节点",
+    "voltage": "实测电压",
 }
 
 # curves 内字段的中文标签（与负载字段同名时区分为“保护曲线”）
@@ -130,6 +139,7 @@ _CUSTOM_MESSAGES = {
     ("min_grading_margin", "greater_than_equal"): "最小级差不能为负（须 ≥ 0）",
     ("steady_current", "greater_than_equal"): "稳态电流不能为负（须 ≥ 0）",
     ("startup_current", "greater_than_equal"): "启动电流不能为负（须 ≥ 0）",
+    ("tolerance", "greater_than_equal"): "残差容限不能为负（须 ≥ 0）",
 }
 
 # curves 内字段的定制提示（“current” 与负载字段同名，须区分）
@@ -363,6 +373,19 @@ def loss_allocation_endpoint(payload: LossAllocationRequest) -> dict:
     )
 
 
+@app.post(
+    "/resistance-calibration",
+    response_model=ResistanceCalibrationResponse,
+    summary="从多组工况的节点实测电压辨识各段电阻（非负最小二乘）",
+)
+def resistance_calibration_endpoint(payload: ResistanceCalibrationRequest) -> dict:
+    return resistance_calibration(
+        segments_in=payload.segments,
+        scenarios_in=payload.scenarios,
+        tolerance=payload.tolerance,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -379,6 +402,7 @@ def index() -> dict:
         "protection_selectivity": "POST /protection-selectivity",
         "startup_order": "POST /startup-order",
         "loss_allocation": "POST /loss-allocation",
+        "resistance_calibration": "POST /resistance-calibration",
         "docs": "/docs",
         "health": "/health",
     }

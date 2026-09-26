@@ -511,3 +511,64 @@ class LossAllocationResponse(BaseModel):
         description="逐负载线损归属（按 loads 输入序号）；同节点多条负载分别列出，"
         "逐负载归属之和与总线损一致（展示舍入差除外）"
     )
+
+
+class VoltageMeasurementInput(BaseModel):
+    """一个非 source 节点的实测电压。"""
+
+    node: str = Field(min_length=1, description="测点节点名称，须为已有的非 source 节点")
+    voltage: float = Field(allow_inf_nan=False, description="实测电压 (V)，须为有限数")
+
+
+class CalibrationScenarioInput(BaseModel):
+    """一个电阻辨识工况：电源电压、恒定负载与非 source 节点的实测电压。"""
+
+    source_voltage: float = Field(gt=0, description="该工况电源电压 (V)，必须为正")
+    loads: list[LoadInput] = Field(
+        default_factory=list, description="该工况各节点恒定负载电流（同 /evaluate 的 loads）"
+    )
+    measurements: list[VoltageMeasurementInput] = Field(
+        default_factory=list, description="该工况非 source 节点的实测电压列表"
+    )
+
+
+class ResistanceCalibrationRequest(BaseModel):
+    """电阻辨识请求：复用 segments（线段电阻不参与拟合），另给工况列表与残差容限。"""
+
+    segments: list[SegmentInput] = Field(
+        min_length=1,
+        description="线段列表，须构成以 source 为根的连通树；resistance 不参与拟合",
+    )
+    scenarios: list[CalibrationScenarioInput] = Field(
+        min_length=1, description="辨识工况列表（至少 1 个），逐工况累计电流并组成压降方程"
+    )
+    tolerance: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="非负残差容限 (V)：最大测点电压残差超过它即为 inconsistent",
+    )
+
+
+class CalibratedSegmentResult(BaseModel):
+    segment_id: str
+    resistance: float = Field(description="该段估计电阻 (Ω)，展示值按 6 位小数舍入")
+
+
+class ResistanceCalibrationResponse(BaseModel):
+    status: str = Field(
+        description="辨识结果：calibrated=辨识成功，undetermined=系数矩阵列秩不足，"
+        "inconsistent=最大测点电压残差超过容限"
+    )
+    segments: Optional[list[CalibratedSegmentResult]] = Field(
+        default=None,
+        description="按输入顺序的各段估计电阻；status=calibrated 时给出，其余为 null",
+    )
+    max_residual: Optional[float] = Field(
+        default=None,
+        description="最大测点电压残差 (V)，展示值按 6 位小数舍入；"
+        "status=calibrated / inconsistent 时给出，undetermined 时为 null",
+    )
+    rank: Optional[int] = Field(
+        default=None,
+        description="系数矩阵列秩；status=undetermined 时给出，其余为 null",
+    )
