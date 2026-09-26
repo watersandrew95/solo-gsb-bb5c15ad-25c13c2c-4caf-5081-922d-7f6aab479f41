@@ -1,0 +1,384 @@
+"""直流配电树压降校核 API。"""
+
+from __future__ import annotations
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from .core import (
+    BaselineViolationError,
+    InputValidationError,
+    capacity,
+    evaluate,
+    load_shedding,
+    loss_allocation,
+    outage_restoration,
+    peak_risk,
+    protection_selectivity,
+    startup_order,
+    unregistered_load,
+)
+from .models import (
+    CapacityRequest,
+    CapacityResponse,
+    EvaluateRequest,
+    EvaluateResponse,
+    LoadSheddingRequest,
+    LoadSheddingResponse,
+    LossAllocationRequest,
+    LossAllocationResponse,
+    OutageRestorationRequest,
+    OutageRestorationResponse,
+    PeakRiskRequest,
+    PeakRiskResponse,
+    ProtectionSelectivityRequest,
+    ProtectionSelectivityResponse,
+    StartupOrderRequest,
+    StartupOrderResponse,
+    UnregisteredLoadRequest,
+    UnregisteredLoadResponse,
+)
+
+app = FastAPI(
+    title="直流配电树压降校核 API",
+    description=(
+        "接收以 source 为根的配电树（线段电阻 / 额定电流、节点恒定负载），"
+        "自叶向根累计各段电流，自根向叶计算压降与节点电压，"
+        "返回超额定电流与欠压位置；并可评估指定节点可追加的最大恒定负载电流，"
+        "根据线段实测电流定位唯一未登记正恒定负载的候选节点，"
+        "评估至多 K 条负载同时升至峰值时的最坏越限风险，"
+        "在故障线段断开后评估各候选跨接线的恢复方案并按最低节点电压余量择优，"
+        "枚举可切除负载组合，选出以最小切除电流消除全部越限的切负荷方案，"
+        "按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险，"
+        "为待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序，"
+        "或按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属。"
+    ),
+    version="1.8.0",
+)
+
+
+def _error_body(code: str, message: str, details: list) -> dict:
+    return {"error": {"code": code, "message": message, "details": details}}
+
+
+# 字段中文标签与常见校验错误的定制提示
+_FIELD_LABELS = {
+    "source_voltage": "电源电压",
+    "min_voltage": "最低允许电压",
+    "segments": "线段列表",
+    "loads": "负载列表",
+    "id": "线段标识",
+    "parent": "父节点",
+    "child": "子节点",
+    "resistance": "电阻",
+    "rated_current": "额定电流",
+    "node": "节点",
+    "current": "负载电流",
+    "target_node": "目标节点",
+    "measurements": "测点列表",
+    "segment_id": "线段标识",
+    "peak_current": "峰值电流",
+    "max_simultaneous_peaks": "最大同时峰值数",
+    "faulty_segment_id": "故障线段标识",
+    "jumpers": "跨接线列表",
+    "supply_node": "供电侧节点",
+    "outage_node": "失电侧节点",
+    "sheddable_loads": "可切除负载列表",
+    "curves": "保护曲线列表",
+    "points": "曲线点列表",
+    "time": "动作时间",
+    "faults": "故障列表",
+    "min_grading_margin": "最小级差",
+    "startup_loads": "待投运负载列表",
+    "steady_current": "稳态电流",
+    "startup_current": "启动电流",
+}
+
+# measurements 内字段的中文标签（与负载字段同名时区分为“实测”）
+_MEASUREMENT_FIELD_LABELS = {
+    "current": "实测电流",
+    "segment_id": "测点线段标识",
+}
+
+# curves 内字段的中文标签（与负载字段同名时区分为“保护曲线”）
+_CURVE_FIELD_LABELS = {
+    "segment_id": "曲线线段标识",
+    "current": "曲线电流",
+    "time": "动作时间",
+}
+
+# faults 内字段的中文标签
+_FAULT_FIELD_LABELS = {
+    "node": "故障节点",
+    "current": "故障电流",
+}
+
+# jumpers 内字段的中文标签（与线段字段同名时区分为“跨接线”）
+_JUMPER_FIELD_LABELS = {
+    "id": "跨接线标识",
+}
+
+_CUSTOM_MESSAGES = {
+    ("source_voltage", "greater_than"): "电源电压必须为正数（> 0）",
+    ("resistance", "greater_than_equal"): "电阻不能为负（须 ≥ 0）",
+    ("current", "greater_than_equal"): "负载电流不能为负（须 ≥ 0）",
+    ("rated_current", "greater_than"): "额定电流必须为正数（> 0）",
+    ("min_voltage", "greater_than_equal"): "最低允许电压不能为负（须 ≥ 0）",
+    ("peak_current", "greater_than_equal"): "峰值电流不能为负（须 ≥ 0）",
+    ("max_simultaneous_peaks", "greater_than_equal"): "最大同时峰值数不能为负（须 ≥ 0）",
+    ("min_grading_margin", "greater_than_equal"): "最小级差不能为负（须 ≥ 0）",
+    ("steady_current", "greater_than_equal"): "稳态电流不能为负（须 ≥ 0）",
+    ("startup_current", "greater_than_equal"): "启动电流不能为负（须 ≥ 0）",
+}
+
+# curves 内字段的定制提示（“current” 与负载字段同名，须区分）
+_CURVE_CUSTOM_MESSAGES = {
+    ("current", "greater_than_equal"): "曲线电流不能为负（须 ≥ 0）",
+    ("time", "greater_than_equal"): "动作时间不能为负（须 ≥ 0）",
+}
+
+# faults 内字段的定制提示
+_FAULT_CUSTOM_MESSAGES = {
+    ("current", "greater_than"): "故障电流必须为正数（> 0）",
+}
+
+
+def _translate_error(err: dict) -> dict:
+    loc = [str(x) for x in err.get("loc", []) if x != "body"]
+    field = loc[-1] if loc else ""
+    in_measurements = "measurements" in loc
+    in_curves = "curves" in loc
+    in_faults = "faults" in loc
+    in_jumpers = "jumpers" in loc
+    in_sheddable = "sheddable_loads" in loc
+    if in_measurements:
+        label = _MEASUREMENT_FIELD_LABELS.get(field, field or "请求体")
+    elif in_curves:
+        label = _CURVE_FIELD_LABELS.get(field, _FIELD_LABELS.get(field, field or "请求体"))
+    elif in_faults:
+        label = _FAULT_FIELD_LABELS.get(field, _FIELD_LABELS.get(field, field or "请求体"))
+    elif in_jumpers:
+        label = _JUMPER_FIELD_LABELS.get(field, _FIELD_LABELS.get(field, field or "请求体"))
+    elif in_sheddable and field.isdigit():
+        label = f"可切除负载序号（第 {int(field) + 1} 个）"
+    else:
+        label = _FIELD_LABELS.get(field, field or "请求体")
+    err_type = err.get("type", "")
+    ctx = err.get("ctx", {})
+
+    if in_measurements:
+        custom = None
+    elif in_curves:
+        custom = _CURVE_CUSTOM_MESSAGES.get((field, err_type))
+    elif in_faults:
+        custom = _FAULT_CUSTOM_MESSAGES.get((field, err_type))
+    else:
+        custom = _CUSTOM_MESSAGES.get((field, err_type))
+    if custom:
+        message = custom
+    elif err_type == "missing":
+        message = f"缺少必填字段：{label}"
+    elif err_type == "greater_than":
+        message = f"{label}必须大于 {ctx.get('gt')}"
+    elif err_type == "greater_than_equal":
+        message = f"{label}不能小于 {ctx.get('ge')}"
+    elif err_type == "finite_number":
+        message = f"{label}必须为有限数值"
+    elif err_type == "string_too_short":
+        message = f"{label}不能为空字符串"
+    elif err_type in ("too_short", "list_too_short"):
+        message = f"{label}不能为空"
+    elif err_type in ("too_long", "list_too_long"):
+        message = f"{label}最多包含 {ctx.get('max_length')} 条"
+    elif err_type == "value_error":
+        message = err.get("msg", "参数无效")
+        if message.startswith("Value error, "):
+            message = message[len("Value error, "):]
+    elif err_type.endswith("_parsing") or err_type.endswith("_type"):
+        message = f"{label}的类型无效"
+    else:
+        message = err.get("msg", "参数无效")
+    return {"field": ".".join(loc), "message": message}
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    details = [_translate_error(err) for err in exc.errors()]
+    return JSONResponse(
+        status_code=422,
+        content=_error_body("validation_error", "请求参数校验失败", details),
+    )
+
+
+@app.exception_handler(InputValidationError)
+async def input_validation_handler(request: Request, exc: InputValidationError) -> JSONResponse:
+    details = [{"field": None, "message": item} for item in exc.details]
+    return JSONResponse(
+        status_code=400,
+        content=_error_body("invalid_input", exc.message, details),
+    )
+
+
+@app.exception_handler(BaselineViolationError)
+async def baseline_violation_handler(request: Request, exc: BaselineViolationError) -> JSONResponse:
+    details = [{"field": None, "message": item} for item in exc.details]
+    return JSONResponse(
+        status_code=400,
+        content=_error_body("baseline_violation", exc.message, details),
+    )
+
+
+@app.post(
+    "/evaluate",
+    response_model=EvaluateResponse,
+    summary="校核直流配电树的压降、线段电流与电压越限",
+)
+def evaluate_endpoint(payload: EvaluateRequest) -> dict:
+    return evaluate(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+    )
+
+
+@app.post(
+    "/capacity",
+    response_model=CapacityResponse,
+    summary="评估目标节点可追加的最大恒定负载电流",
+)
+def capacity_endpoint(payload: CapacityRequest) -> dict:
+    return capacity(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        target_node=payload.target_node,
+    )
+
+
+@app.post(
+    "/unregistered-load",
+    response_model=UnregisteredLoadResponse,
+    summary="根据线段实测电流定位唯一未登记正恒定负载的候选节点",
+)
+def unregistered_load_endpoint(payload: UnregisteredLoadRequest) -> dict:
+    return unregistered_load(
+        source_voltage=payload.source_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        measurements_in=payload.measurements,
+    )
+
+
+@app.post(
+    "/peak-risk",
+    response_model=PeakRiskResponse,
+    summary="评估至多 K 条负载同时升至峰值时的最坏越限风险",
+)
+def peak_risk_endpoint(payload: PeakRiskRequest) -> dict:
+    return peak_risk(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        max_simultaneous_peaks=payload.max_simultaneous_peaks,
+    )
+
+
+@app.post(
+    "/outage-restoration",
+    response_model=OutageRestorationResponse,
+    summary="故障线段断开后评估候选跨接线的恢复方案并择优",
+)
+def outage_restoration_endpoint(payload: OutageRestorationRequest) -> dict:
+    return outage_restoration(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        faulty_segment_id=payload.faulty_segment_id,
+        jumpers_in=payload.jumpers,
+    )
+
+
+@app.post(
+    "/load-shedding",
+    response_model=LoadSheddingResponse,
+    summary="枚举可切除负载组合，选出以最小切除电流消除全部越限的切负荷方案",
+)
+def load_shedding_endpoint(payload: LoadSheddingRequest) -> dict:
+    return load_shedding(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        sheddable_indices=payload.sheddable_loads,
+    )
+
+
+@app.post(
+    "/protection-selectivity",
+    response_model=ProtectionSelectivityResponse,
+    summary="按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险",
+)
+def protection_selectivity_endpoint(payload: ProtectionSelectivityRequest) -> dict:
+    return protection_selectivity(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        curves_in=payload.curves,
+        faults_in=payload.faults,
+        min_grading_margin=payload.min_grading_margin,
+    )
+
+
+@app.post(
+    "/startup-order",
+    response_model=StartupOrderResponse,
+    summary="为待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序",
+)
+def startup_order_endpoint(payload: StartupOrderRequest) -> dict:
+    return startup_order(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        startup_loads_in=payload.startup_loads,
+    )
+
+
+@app.post(
+    "/loss-allocation",
+    response_model=LossAllocationResponse,
+    summary="按未舍入基线电流计算逐段线损（P=I²R）并按负载逐条归属",
+)
+def loss_allocation_endpoint(payload: LossAllocationRequest) -> dict:
+    return loss_allocation(
+        source_voltage=payload.source_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+    )
+
+
+@app.get("/health", summary="健康检查")
+def health() -> dict:
+    return {"status": "ok"}
+@app.get("/", summary="服务信息")
+def index() -> dict:
+    return {
+        "service": "dc-tree-voltage-drop-api",
+        "evaluate": "POST /evaluate",
+        "capacity": "POST /capacity",
+        "unregistered_load": "POST /unregistered-load",
+        "peak_risk": "POST /peak-risk",
+        "outage_restoration": "POST /outage-restoration",
+        "load_shedding": "POST /load-shedding",
+        "protection_selectivity": "POST /protection-selectivity",
+        "startup_order": "POST /startup-order",
+        "loss_allocation": "POST /loss-allocation",
+        "docs": "/docs",
+        "health": "/health",
+    }
